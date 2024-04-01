@@ -15,6 +15,9 @@ from transformers import AutoTokenizer, AutoModel
 MAX_LENGTH = 256
 BATCH_SIZE = 64
 
+# if you run this file directly inside the src/ directory
+# (as opposed to the outer root directory of the project)
+# the filepaths should be '../res/{file}.csv' instead
 FILEPATH_TRAIN = 'res/train.csv'
 FILEPATH_TEST = 'res/test.csv'
 
