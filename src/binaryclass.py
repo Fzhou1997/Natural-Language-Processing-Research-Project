@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torcheval.metrics.functional import multiclass_f1_score, multiclass_auroc, multiclass_accuracy
+from torcheval.metrics.functional import binary_f1_score, binary_auroc, binary_accuracy
 
 from transformers import AutoTokenizer, AutoModel
 
@@ -86,10 +86,10 @@ class RatingModel(nn.Module):
             param.requires_grad = False  # freeze BERT weights
 
         # linear layer on top to condense features into regressor
-        self.linear1 = nn.Linear(768, 512)
-        self.linear2 = nn.Linear(512, 256)
-        self.linear3 = nn.Linear(256, 64)
-        self.linear4 = nn.Linear(64, 2)
+        self.linear1 = nn.Linear(768, 512)  # 393728
+        self.linear2 = nn.Linear(512, 256)  # 131328
+        self.linear3 = nn.Linear(256, 64)   #  16448
+        self.linear4 = nn.Linear(64, 2)     #    130
 
     def forward(self, x):
         x = self.bert(**x)
@@ -126,13 +126,15 @@ class ModelTrainer:
             X['attention_mask'] = X['attention_mask'].cpu()
         y_pred = torch.cat(tensors)
 
-        acc = multiclass_accuracy(y_pred, y_test, num_classes=2, average=None)
+        y_pred = torch.argmax(y_pred, dim=1)
+
+        acc = binary_accuracy(y_pred, y_test)
         print('acc', acc)
 
-        f1 = multiclass_f1_score(y_pred, y_test, num_classes=2, average=None)
+        f1 = binary_f1_score(y_pred, y_test)
         print('f1', f1)
 
-        auc = multiclass_auroc(y_pred, y_test, num_classes=2, average=None)
+        auc = binary_auroc(y_pred, y_test)
         print('auc', auc)
 
     def train(self):
@@ -256,6 +258,3 @@ if __name__ == '__main__':
 
     # trainer.train()
     trainer.evaluate()
-
-
-
