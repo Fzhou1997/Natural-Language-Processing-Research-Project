@@ -100,7 +100,6 @@ class RatingModel(nn.Module):
         x = self.linear4(x)
         return x
 
-
 class ModelTrainer:
     def __init__(self, model, loss_fn, optimizer, train_dataset, test_dataset, device, tb_writer):
         self.model = model
