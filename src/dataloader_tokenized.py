@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.dataset import ReviewDataset
-from src.tokenizer import Tokenizer
+from src.tokenizer_bert import Tokenizer
 
 if torch.backends.mps.is_available():
     device = torch.device('mps')

@@ -9,8 +9,8 @@ import pandas as pd
 import shap
 import torch
 
-from src.classifier import Classifier
-from src.tokenizer import Tokenizer
+from src.classifier_binary import Classifier
+from src.tokenizer_bert import Tokenizer
 
 if torch.backends.mps.is_available():
     device = torch.device('mps')

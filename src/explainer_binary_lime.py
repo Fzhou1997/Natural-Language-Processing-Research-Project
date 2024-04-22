@@ -2,8 +2,8 @@ import numpy.typing as npt
 import torch
 from lime.lime_text import LimeTextExplainer
 
-from src.classifier import Classifier
-from src.tokenizer import Tokenizer
+from src.classifier_binary import Classifier
+from src.tokenizer_bert import Tokenizer
 
 
 class Explainer:

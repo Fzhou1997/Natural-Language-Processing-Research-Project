@@ -1,260 +1,163 @@
-import numpy as np
-import pandas as pd
-
-from torch.utils.tensorboard import SummaryWriter
-from datetime import datetime
-
-from tqdm import tqdm
+from os import PathLike
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torcheval.metrics.functional import binary_f1_score, binary_auroc, binary_accuracy
+from sklearn.metrics import confusion_matrix
+from torch.nn import Module, Linear
+from torch.nn.functional import relu, softmax
+from torch.nn.modules.loss import _Loss
+from torch.optim import Optimizer
+from torch.utils.tensorboard import SummaryWriter
+from torchmetrics import Accuracy, F1Score, AUROC
+from transformers import AutoModel
 
-from transformers import AutoTokenizer, AutoModel
+from src.dataloader_tokenized import ReviewDataLoader
 
-MODEL = 'google-bert/bert-base-uncased'
-MAX_LENGTH = 256
-BATCH_SIZE = 64
-
-# if you run this file directly inside the src/ directory
-# (as opposed to the outer root directory of the project)
-# the filepaths should be '../data/{file}.csv' instead
-FILEPATH_TRAIN = 'data/train.csv'
-FILEPATH_TEST = 'data/test.csv'
-
-
-def load_dataframe(filepath):
-    df = pd.read_csv(filepath)
-
-    # data cleaning
-    df = df.drop(['uniqueID', 'date'], axis=1)
-    df.columns = ['drug_name', 'condition', 'review', 'rating', 'useful_count']
-    df.drug_name = df.drug_name.str.lower()
-    df.condition = df.condition.str.lower()
-
-    # remove leading/trailing quotes
-    df.review = df.review.map(lambda review: review[1:-1])
-
-    return df
+if torch.backends.mps.is_available():
+    device = torch.device('mps')
+elif torch.cuda.is_available():
+    device = torch.device('cuda')
+else:
+    device = torch.device('cpu')
 
 
-class ReviewDataset(Dataset):
-    def __init__(self, filepath, tokenizer):
-        self.data = pd.read_csv(filepath).reset_index(drop=True)
-        self.tokenizer = tokenizer
-
-        # data cleaning
-        self.data = self.data.drop(['uniqueID', 'date'], axis=1)
-        self.data.columns = ['drug_name', 'condition',
-                             'review', 'rating', 'useful_count']
-
-        # create binary sentiment label
-        self.data = self.data[(self.data.rating == 1) | (self.data.rating == 10)].reset_index(drop=True)
-        self.data['sentiment'] = np.where(self.data.rating == 1, 0, 1)
-
-        self.data.drug_name = self.data.drug_name.str.lower()
-        self.data.condition = self.data.condition.str.lower()
-
-        # remove leading/trailing quotes
-        self.data.review = self.data.review.map(lambda review: review[1:-1])
-
-        tokens = tokenizer(
-            list(self.data.review.values),
-            return_tensors='pt',
-            padding='max_length',
-            max_length=MAX_LENGTH,
-            truncation=True)
-        input_ids = torch.squeeze(tokens['input_ids'])
-        attention_mask = torch.squeeze(tokens['attention_mask'])
-        self.X = dict(input_ids=input_ids, attention_mask=attention_mask)
-        self.y = torch.tensor(self.data.sentiment).long()
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return dict(input_ids=self.X['input_ids'][idx], attention_mask=self.X['attention_mask'][idx]), self.y[idx]
-
-
-class RatingModel(nn.Module):
-    def __init__(self):
+class Classifier(Module):
+    def __init__(self, model: str):
         super().__init__()
-        self.bert = AutoModel.from_pretrained(MODEL, output_attentions=False, return_dict=False)
+        self.bert = AutoModel.from_pretrained(model, output_attentions=False, return_dict=False)
         for param in self.bert.parameters():
-            param.requires_grad = False  # freeze BERT weights
+            param.requires_grad = False
+        self.linear1 = Linear(768, 512)
+        self.linear2 = Linear(512, 256)
+        self.linear3 = Linear(256, 64)
+        self.linear4 = Linear(64, 2)
 
-        # linear layer on top to condense features into regressor
-        self.linear1 = nn.Linear(768, 512)  # 393728
-        self.linear2 = nn.Linear(512, 256)  # 131328
-        self.linear3 = nn.Linear(256, 64)   #  16448
-        self.linear4 = nn.Linear(64, 2)     #    130
+    def forward(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        y = self.bert(**x)
+        y = y[0][:, 0, :]
+        y = relu(self.linear1(y))
+        y = relu(self.linear2(y))
+        y = relu(self.linear3(y))
+        y = self.linear4(y)
+        return y
 
-    def forward(self, x):
-        x = self.bert(**x)
-        x = x[0][:, 0, :]  # only look at [CLS] token
-        x = F.relu(self.linear1(x))
-        x = F.relu(self.linear2(x))
-        x = F.relu(self.linear3(x))
-        x = self.linear4(x)
-        return x
 
-class ModelTrainer:
-    def __init__(self, model, loss_fn, optimizer, train_dataset, test_dataset, device, tb_writer):
-        self.model = model
+class Trainer:
+    def __init__(self,
+                 model: Classifier,
+                 loss_fn: _Loss,
+                 optimizer: Optimizer,
+                 train_loader: ReviewDataLoader,
+                 test_loader: ReviewDataLoader,
+                 writer: SummaryWriter,
+                 out_path: str | bytes | PathLike[str] | PathLike[bytes]):
+        self.model = model.to(device)
         self.loss_fn = loss_fn
+        self.accuracy_fn = Accuracy(task='binary').to(device)
         self.optimizer = optimizer
-        self.train_dataset = train_dataset
-        self.test_dataset = test_dataset
-        self.train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
-        self.test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
-        self.device = device
-        self.tb_writer = tb_writer
+        self.train_loader = train_loader
+        self.test_loader = test_loader
+        self.writer = writer
+        self.out_path = out_path
 
-    def evaluate(self):
-        self.model.eval()
-        self.model.to(self.device)
-        y_test = self.test_dataset.y
-
-        tensors = []
-        for (X, _) in tqdm(self.test_dataloader, desc='evaluating on test set'):
-            X['input_ids'] = X['input_ids'].to(self.device)
-            X['attention_mask'] = X['attention_mask'].to(self.device)
-            tensors.append(model(X).detach().cpu())
-            X['input_ids'] = X['input_ids'].cpu()
-            X['attention_mask'] = X['attention_mask'].cpu()
-        y_pred = torch.cat(tensors)
-
-        y_pred = torch.argmax(y_pred, dim=1)
-
-        acc = binary_accuracy(y_pred, y_test)
-        print('acc', acc)
-
-        f1 = binary_f1_score(y_pred, y_test)
-        print('f1', f1)
-
-        auc = binary_auroc(y_pred, y_test)
-        print('auc', auc)
-
-    def train(self):
+    def _train_one_epoch(self) -> tuple[float, float]:
+        running_loss = 0
+        self.accuracy_fn.reset()
         self.model.train()
-        epoch_number = 0
-
-        EPOCHS = 10
-        best_vloss = 1_000_000.
-        for epoch in range(EPOCHS):
-            print('EPOCH {}:'.format(epoch_number + 1))
-
-            # Make sure gradient tracking is on, and do a pass over the data
-            self.model.train(True)
-            avg_loss = self.train_one_epoch(epoch_number)
-
-            running_vloss = 0.0
-            # Set the model to evaluation mode, disabling dropout and using population
-            # statistics for batch normalization.
-            self.model.eval()
-
-            # Disable gradient computation and reduce memory consumption.
-            with torch.no_grad():
-                for i, vdata in enumerate(self.test_dataloader):
-                    vinputs, vlabels = vdata
-                    vinputs['input_ids'] = vinputs['input_ids'].to(device)
-                    vinputs['attention_mask'] = vinputs['attention_mask'].to(device)
-                    vlabels = vlabels.to(device)
-
-                    voutputs = self.model(vinputs)
-                    vloss = self.loss_fn(voutputs, vlabels)
-                    running_vloss += vloss
-
-                    vinputs['input_ids'] = vinputs['input_ids'].cpu()
-                    vinputs['attention_mask'] = vinputs['attention_mask'].cpu()
-
-            avg_vloss = running_vloss / (i + 1)
-            print('LOSS train {} valid {}'.format(avg_loss, avg_vloss))
-
-            # Log the running loss averaged per batch
-            # for both training and validation
-            self.tb_writer.add_scalars('Training vs. Validation Loss',
-                                       {'Training': avg_loss, 'Validation': avg_vloss},
-                                       epoch_number + 1)
-            self.tb_writer.flush()
-
-            # Track best performance, and save the model's state
-            if avg_vloss < best_vloss:
-                best_vloss = avg_vloss
-                model_path = 'binaryclass_model_{}_{}'.format(timestamp, epoch_number)
-                torch.save(self.model.state_dict(), model_path)
-
-            epoch_number += 1
-
-    def train_one_epoch(self, epoch_index):
-        running_loss = 0.
-        last_loss = 0.
-
-        for idx, (X, y) in enumerate(self.train_dataloader):
-            X['input_ids'] = X['input_ids'].to(self.device)
-            X['attention_mask'] = X['attention_mask'].to(self.device)
-            y = y.to(self.device)
-
+        for features, labels in self.train_loader:
             self.optimizer.zero_grad()
-            y_pred = model(X)
-            loss = self.loss_fn(y_pred, y)
+            predicted = self.model(features)
+            loss = self.loss_fn(predicted, labels)
             loss.backward()
             self.optimizer.step()
-
-            X['input_ids'] = X['input_ids'].cpu()
-            X['attention_mask'] = X['attention_mask'].cpu()
-
-            # log metrics
             running_loss += loss.item()
-            if idx % 100 == 99:
-                last_loss = running_loss / 100  # loss per batch
-                print('  batch {} loss: {}'.format(idx + 1, last_loss))
-                tb_x = epoch_index * len(self.train_dataloader) + idx + 1
-                self.tb_writer.add_scalar('Loss/train', last_loss, tb_x)
-                running_loss = 0.
+            probs = softmax(predicted, dim=1)
+            pred = probs.argmax(dim=1)
+            self.accuracy_fn.update(pred, labels)
+        running_loss /= len(self.train_loader)
+        accuracy = self.accuracy_fn.compute().cpu().item()
+        return running_loss, accuracy
 
-        return last_loss
+    def _validate_one_epoch(self) -> tuple[float, float]:
+        loss = 0
+        self.accuracy_fn.reset()
+        self.model.eval()
+        with torch.no_grad():
+            for features, labels in self.test_loader:
+                predicted = self.model(features)
+                loss += self.loss_fn(predicted, labels).item()
+                probs = softmax(predicted, dim=1)
+                pred = probs.argmax(dim=1)
+                self.accuracy_fn.update(pred, labels)
+        loss /= len(self.test_loader)
+        accuracy = self.accuracy_fn.compute().cpu().item()
+        return loss, accuracy
+
+    def train(self, epochs: int) -> tuple[list[float], list[float], list[float], list[float]]:
+        best_loss = float('inf')
+        train_losses = []
+        train_accuracies = []
+        val_losses = []
+        val_accuracies = []
+        for epoch in range(epochs):
+            train_loss, train_accuracy = self._train_one_epoch()
+            val_loss, val_accuracy = self._validate_one_epoch()
+            self.writer.add_scalar('Loss/train', train_loss, epoch)
+            self.writer.add_scalar('Loss/val', val_loss, epoch)
+            self.writer.add_scalar('Accuracy/train', train_accuracy, epoch)
+            self.writer.add_scalar('Accuracy/val', val_accuracy, epoch)
+            self.writer.flush()
+            train_losses.append(train_loss)
+            train_accuracies.append(train_accuracy)
+            val_losses.append(val_loss)
+            val_accuracies.append(val_accuracy)
+            print(f'Epoch {epoch + 1}/{epochs}')
+            print(f'Train Loss: {train_loss:.6f} | Train Accuracy: {train_accuracy:.6f}')
+            print(f'Val Loss: {val_loss:.6f} | Val Accuracy: {val_accuracy:.6f}')
+            if val_loss < best_loss:
+                print(f'Val loss decreased from {best_loss:.6f} to {val_loss:.6f}. Saving model...')
+                best_loss = val_loss
+                torch.save(self.model.state_dict(), self.out_path)
+            print(25*"==")
+        return train_losses, train_accuracies, val_losses, val_accuracies
 
 
-if __name__ == '__main__':
-    device = (
-        'cuda'
-        if torch.cuda.is_available()
-        else 'mps'
-        if torch.backends.mps.is_available()
-        else 'cpu'
-    )
-    print(f'Using {device} device')
+class Tester:
+    def __init__(self,
+                 model: Classifier,
+                 loss_fn: _Loss,
+                 test_loader: ReviewDataLoader):
+        self.model = model.to(device)
+        self.loss_fn = loss_fn
+        self.accuracy_fn = Accuracy(task='binary').to(device)
+        self.f1_score_fn = F1Score(task='binary').to(device)
+        self.auroc_fn = AUROC(task='binary').to(device)
+        self.test_loader = test_loader
+        self.confusion_matrix_fn = confusion_matrix
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
-
-    train_dataset = ReviewDataset(FILEPATH_TRAIN, tokenizer)
-    print(f'{len(train_dataset)} training samples loaded')
-
-    test_dataset = ReviewDataset(FILEPATH_TEST, tokenizer)
-    print(f'{len(test_dataset)} testing samples loaded')
-
-    model = RatingModel().to(device)
-    # 11 # load previous version tgo continue training
-    model.load_state_dict(torch.load('binary_classifier_model'))
-    loss_fn = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
-    # optimizer = torch.optim.Adam(model.parameters())
-
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    writer = SummaryWriter('runs/review_trainer_{}'.format(timestamp))
-
-    trainer = ModelTrainer(
-        model,
-        loss_fn,
-        optimizer,
-        train_dataset,
-        test_dataset,
-        device,
-        writer
-    )
-
-    # trainer.train()
-    trainer.evaluate()
+    def test(self) -> tuple[float, float, float, float, list[list[int]]]:
+        self.model.eval()
+        loss = 0
+        self.accuracy_fn.reset()
+        self.f1_score_fn.reset()
+        self.auroc_fn.reset()
+        test_labels = torch.empty(0, dtype=torch.long, device=device)
+        test_predictions = torch.empty(0, dtype=torch.long, device=device)
+        with torch.no_grad():
+            for features, labels in self.test_loader:
+                predicted = self.model(features)
+                loss += self.loss_fn(predicted, labels).item()
+                probs = softmax(predicted, dim=1)
+                pred = probs.argmax(dim=1)
+                self.accuracy_fn.update(pred, labels)
+                self.f1_score_fn.update(pred, labels)
+                self.auroc_fn.update(pred, labels)
+                test_labels = torch.cat((test_labels, labels))
+                test_predictions = torch.cat((test_predictions, pred))
+        loss /= len(self.test_loader)
+        accuracy = self.accuracy_fn.compute().cpu()
+        f1_score = self.f1_score_fn.compute().cpu()
+        auroc = self.auroc_fn.compute().cpu()
+        test_labels = test_labels.cpu().numpy()
+        test_predictions = test_predictions.cpu().numpy()
+        cm = self.confusion_matrix_fn(test_labels, test_predictions)
+        return loss, accuracy, f1_score, auroc, cm
