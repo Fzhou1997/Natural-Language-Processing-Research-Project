@@ -1,4 +1,5 @@
 venv/
 runs/
 models/
-res/all.csv
+data/
+explanations/
